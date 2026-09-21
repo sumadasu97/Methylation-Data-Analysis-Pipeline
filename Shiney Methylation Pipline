@@ -1,0 +1,234 @@
+library(shiny)
+library(readxl)
+library(dplyr)
+library(tidyr) # For pivot_longer
+library(ggrepel)
+library(clusterProfiler)
+library(org.Hs.eg.db) # Human database example
+library(enrichplot)
+library(ggplot2)
+library(DT)
+library(tidyverse)
+
+
+#####################################
+#STEP 1: Multiple file selector 
+#       Column Selector for pathways
+#####################################
+
+ui <- fluidPage(
+  titlePanel("Methylation Data Anlysis Pipeline"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("files", "Upload Multiple Excel Files",
+                multiple = TRUE,
+                accept = c(".xlsx", ".xls") #
+      ),
+      uiOutput("column_selector"),
+      uiOutput("column_selectors"), # Dynamic UI for column selection
+      #selectInput("id_type", "Select Gene ID Type", 
+                  #choices = c("SYMBOL", "ENTREZID", "ENSEMBL")),
+      actionButton("run", "Run Analysis", class = "btn-primary"),
+      downloadButton("download_data", "Download Processed Data"),
+    
+    ),
+
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Density Plots",plotOutput("density_plots")),
+        tabPanel("Pathway Chart", plotOutput("dotplot")),
+        tabPanel("Enrichment Table", DTOutput("table")),
+        #tab Panel("Raw Data", DTOutput("raw_data")),
+        tableOutput("keggResults"),
+        tabPanel("Raw Data", DTOutput("merged_table"))
+
+      )
+    )
+  )
+)
+# Define the Server logic
+server <- function(input, output, session) {
+ options(shiny.maxRequestSize = 1000*1024^2) 
+  # Reactive function to read and process all uploaded files
+  processed_data <- reactive({
+    req(input$files) # Ensure files are uploaded
+    
+    # Read and process each file in the list
+    df_list <- lapply(input$files$datapath, function(file) {
+      df <- read_excel(file) #
+      
+      # Data Processing Steps:
+      # 1. Rename few columns (adjust names as per your actual data)
+      # Example: Rename 'OldName1' to 'NewName1', 'OldName2' to 'NewName2'
+      # You need to adjust the old names to match your files
+      df <- df %>% dplyr::rename(Control_methylation_level="Control methylation level",  Case_methylation_level="Case methylation level",Macaca_fascicularis_Gene="Macaca fascicularis (Macaca_fascicularis_6.0.111) _Gene",P_Value="p-value")
+      
+      # 2. Filter some rows containing "chromosome X" (adjust column name as needed)
+      # Example: Filter out rows where 'Chromosome' column contains "X"
+      df <- df %>% filter(Chromosome != "X")
+      df<- df %>% separate_wider_delim(`Region`, delim = "..", names = c("Start", "End"))
+      # 3. Find the difference between 2 columns and store in a new 3rd column
+      # Example: Assume columns 'Value1' and 'Value2' exist
+      df <- df %>% mutate(Methylation_Difference = Case_methylation_level - Control_methylation_level)
+      df <- df %>% filter(Methylation_Difference >= 0.25 | Methylation_Difference <= -0.25)
+      
+      # 4. Subset some coMethylation_Differencelumns
+      # Example: Select only specific columns
+      df <- df %>% dplyr::select(Chromosome,Start,End,Case_methylation_level, Control_methylation_level,Macaca_fascicularis_Gene,Methylation_Difference,P_Value,Day)
+      
+      # Add a 'Day' column to group by in the plot (assuming day info is in filename or consistent across files for a single run)
+      # For simplicity, let's assume a 'Day' column exists in the input files.
+      
+      return(df)
+    })
+    
+    # Merge the processed files (assuming all files have the same columns)
+    merged_df <- do.call(rbind, df_list) #
+    
+    # Ensure 'Day' column is a factor for grouping in plots
+    if ("Day" %in% names(merged_df)) {
+      merged_df$Day <- as.factor(merged_df$Day)
+    }
+    
+    return(merged_df)
+  })
+  
+  # Render dynamic UI for column selectors once data is loaded
+  output$column_selectors <- renderUI({
+    data <- processed_data()
+    if (!is.null(data)) {
+      numeric_cols <- names(select_if(data, is.numeric))
+      tagList(
+        selectInput("col_x", "Select X column for Density plot", choices = numeric_cols),
+        selectInput("col_y", "Select Y column for Density plot", choices = numeric_cols)
+      )
+    }
+  })
+  
+  # Render the merged data table
+  output$merged_table <- renderDataTable({
+    processed_data()
+  })
+  
+
+  # Dynamic UI to select the column with Gene IDs
+  output$column_selector <- renderUI({
+    req(processed_data())
+    selectInput("gene_col", "Select Gene ID Column", choices = colnames(processed_data()))
+  })
+
+  # 3. Process and Run KEGG
+  keggRes <- eventReactive(input$run, {
+    req(processed_data(), input$gene_col)
+    
+    # Extract gene list from selected column
+    genes <- processed_data()[[input$gene_col]]
+    
+    # Map IDs (assuming gene symbols)
+    entrezIds <- bitr(genes, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+    
+    # Run Enrichment
+    enrichKEGG(gene = entrezIds$ENTREZID, organism = 'hsa', pvalueCutoff = 0.05)
+  })
+  
+  # Pathway Chart (Dotplot)
+  output$barplot <- renderPlot({
+    req(keggRes())
+    barplot(keggRes(), showCategory = 15) + 
+      ggtitle("Top Enriched Pathways")
+  })
+
+
+  # Results Table
+  output$table <- renderDT({
+    req( keggRes())
+    as.data.frame(keggRes())
+  })
+
+   # Render the density plots
+  output$density_plots <- renderPlot({
+    data <- processed_data()
+   desired_order <- c("D1","D2","D3","D4","D5","D6","D7")
+   data$Day <- factor(data$Day,levels = desired_order)
+   req(input$col_x, input$col_y) # Require columns to be selected
+   df_long <- data %>%
+   pivot_longer(
+    cols = c("Case_methylation_level", "Control_methylation_level"), # Columns to gather
+    names_to = "Variable",         # New column for variable names (ColumnA/ColumnB)
+   values_to = "Value"            # New column for values
+  )
+
+# 3. Calculate means for each variable and each day group for the mean lines
+means_df <- df_long %>%
+  group_by(Day, Variable) %>%
+  summarize(MeanValue = mean(Value, na.rm = TRUE), .groups = 'drop') %>%
+  complete(Day, Variable, fill = list(MeanValue = NA)) # Ensure all facets are present
+# 4. Generate the multi-faceted density plot with mean lines
+ggplot(df_long, aes(x = Value,color = Variable, fill = Variable)) + # Map Variable to color/fill
+  geom_density(alpha = 0.5) + # Add density plot with transparency
+  geom_vline(
+    data = means_df,
+    aes(xintercept = MeanValue, color = Variable),
+    linetype = "dashed",
+    size = 1
+  ) + # Add dashed mean lines
+  facet_wrap(~ Day, scales = "free_y") + # Create facets for each day
+  scale_fill_manual(values = c("Green", "blue")) + # Manually set fill colors
+  scale_color_manual(values = c("Green", "blue")) + # Manually set line colors
+ geom_text_repel(data = means_df,
+                  aes(x = MeanValue, y = 0, label = round(MeanValue, 2)),
+                  nudge_y = 0.05,
+                  direction = "x",
+                  #angle = 90,
+                  hjust = 0,
+                  vjust = 0.5,
+                  box.padding = 0.5,
+                  point.padding = 0.5,
+                  force = 1,
+                  size=3,
+                  segment.color = 'grey50')+
+
+labs(
+    title = "Methylation Density by Timepoint",
+    x = "Methylation Level",
+    y = "Density",
+  
+  ) +
+  theme_minimal()
+
+
+  })
+ output$download_data <- downloadHandler(
+    filename = function() {
+      "processed_merged_data.xlsx"
+    },
+    content = function(file) {
+      # Requires the 'writexl' package
+      writexl::write_xlsx(processed_data(), path = file)
+    }
+  )
+#}
+
+
+# Data Preview
+  output$raw_data <- renderDT({
+    req(processed_data())
+    processed_data()
+  })
+
+# 4. Outputs
+  #output$preview <- renderTable({ head(df()) })
+  output$keggResults <- renderTable({
+    req(keggRes())
+    as.data.frame(keggRes())
+  })
+}
+
+
+shinyApp(ui = ui, server = server)
+
+
+
+
+
